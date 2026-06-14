@@ -1,0 +1,5 @@
+# Append this block to /etc/caddy/Caddyfile (adjust the hostname if you
+# later switch to a real domain), then: systemctl reload caddy
+43-129-25-76.nip.io {
+    reverse_proxy 127.0.0.1:8011
+}
