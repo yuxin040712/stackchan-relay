@@ -1,12 +1,24 @@
 import secrets
 
 from fastapi import Body, FastAPI, HTTPException, Query
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app import state
 from app.config import POLL_TIMEOUT, TOKEN
 from app.mcp_tools import mcp
 
 mcp_app = mcp.streamable_http_app()
+
+
+async def _force_host(request, call_next):
+    request.scope["headers"] = [
+        (k, v) for (k, v) in request.scope["headers"] if k != b"host"
+    ] + [(b"host", b"127.0.0.1:8011")]
+    return await call_next(request)
+
+mcp_app.add_middleware(BaseHTTPMiddleware, dispatch=_force_host)
+
+
 
 app = FastAPI(lifespan=lambda _app: mcp_app.router.lifespan_context(_app))
 app.mount(f"/mcp/{TOKEN}", mcp_app)

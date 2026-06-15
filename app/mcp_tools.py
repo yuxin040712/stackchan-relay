@@ -15,6 +15,7 @@ mcp = FastMCP(
 )
 
 
+
 @mcp.tool()
 async def stackchan_speak(text: str) -> str:
     """Make StackChan say something out loud.
