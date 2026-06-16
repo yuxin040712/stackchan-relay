@@ -4,7 +4,6 @@ import time
 from app.config import ONLINE_THRESHOLD
 
 _lock = asyncio.Lock()
-_command_ready = asyncio.Event()
 
 _next_id = 1
 _pending_command: dict | None = None
@@ -27,35 +26,17 @@ async def push_command(action: str, **fields) -> dict:
     async with _lock:
         _pending_command = command
         _last_command = command
-        _command_ready.set()
     return command
 
 
-async def wait_for_command(timeout: float) -> dict | None:
-    """Wait up to `timeout` seconds for a pending command, then return and
-    clear it. Returns None if nothing arrived in time."""
+async def get_command() -> dict | None:
+    """Return and clear the pending command immediately (non-blocking).
+    Returns None if there is nothing queued."""
     global _pending_command, _last_poll_at
-
-    async with _lock:
-        _last_poll_at = time.time()
-        if _pending_command is not None:
-            command = _pending_command
-            _pending_command = None
-            _command_ready.clear()
-            return command
-
-    try:
-        await asyncio.wait_for(_command_ready.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        async with _lock:
-            _last_poll_at = time.time()
-        return None
-
     async with _lock:
         _last_poll_at = time.time()
         command = _pending_command
         _pending_command = None
-        _command_ready.clear()
         return command
 
 

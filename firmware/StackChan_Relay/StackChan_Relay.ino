@@ -1,7 +1,7 @@
 /*
  * StackChan Relay Client
  *
- * Connects to WiFi, then long-polls a relay server for commands
+ * Connects to WiFi, then short-polls a relay server every 1.5 s for commands
  * (speak / emote / move_head / wiggle) and executes them on the
  * M5StackChan (CoreS3) hardware: Avatar face + RGB LEDs + head servos.
  *
@@ -21,15 +21,15 @@
 using namespace m5avatar;
 
 // ====================== USER CONFIG ======================
-#define WIFI_SSID     "yyw一点也不可爱"
-#define WIFI_PASSWORD "12345678@"
+#define WIFI_SSID     "TP-LINK_F6D0"
+#define WIFI_PASSWORD "a5055201314"
 
 #define RELAY_HOST  "43-129-25-76.nip.io"
 #define RELAY_TOKEN "FjYDQYYC5rUFi3f6vhN26MI1kzu_h2Qy"
 // ===========================================================
 
-#define POLL_TIMEOUT_MS   35000  // server holds /poll for ~25s, give it margin
-#define HTTP_TIMEOUT_MS   10000
+#define HTTP_TIMEOUT_MS   10000  // generous budget for short HTTPS request
+#define POLL_INTERVAL_MS  1500   // idle wait between polls (short-poll strategy)
 #define SERVO_SPEED       400    // 0-1000, moderate speed for move_head
 #define WIGGLE_SPEED      600
 #define WIGGLE_ANGLE_DEG  20
@@ -40,10 +40,12 @@ using namespace m5avatar;
 
 Avatar avatar;
 
-// Reused across requests: creating a fresh WiFiClientSecure (and doing a
-// full TLS handshake) for every /poll cycle is slow and was causing
-// intermittent "HTTP error -1" failures. Keep one TLS connection alive
-// and let HTTPClient's keep-alive reuse it across /poll and /result.
+// Single global TLS client so mbedTLS allocates its ~30 KB context once
+// and never frees/reallocates it. We call netClient.stop() at the start
+// of every poll cycle to avoid reusing a connection the server silently
+// closed (long-poll + Caddy keep-alive makes this a common trap).
+// The result POST that immediately follows a successful poll reuses the
+// freshly-established connection, so it costs no extra handshake.
 WiFiClientSecure netClient;
 HTTPClient http;
 
@@ -190,20 +192,9 @@ void handleWiggle(JsonDocument &doc) {
 // Relay communication
 // ---------------------------------------------------------------------
 
-// On a connection-level failure (negative HTTPClient error code), the
-// underlying socket/TLS session may be wedged. Drop it so the next
-// request starts a clean TCP+TLS handshake instead of reusing it.
-void closeConnectionOnError(int httpCode) {
-  if (httpCode <= 0) {
-    netClient.stop();
-  }
-}
-
 bool pollCommand(JsonDocument &doc) {
-  // Connect timeout covers TCP connect + TLS handshake, which can take a
-  // few seconds against a VPS over Let's Encrypt - give it plenty of room.
-  http.setConnectTimeout(15000);
-  http.setTimeout(POLL_TIMEOUT_MS);
+  http.setConnectTimeout(15000);  // TCP connect + TLS handshake budget
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   String url = String("https://") + RELAY_HOST + "/poll?token=" + RELAY_TOKEN;
   if (!http.begin(netClient, url)) {
@@ -213,9 +204,9 @@ bool pollCommand(JsonDocument &doc) {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[poll] HTTP error %d\n", code);
+    Serial.printf("[poll] error %d (%s)  heap=%d\n",
+                  code, http.errorToString(code).c_str(), ESP.getFreeHeap());
     http.end();
-    closeConnectionOnError(code);
     return false;
   }
 
@@ -233,6 +224,8 @@ bool pollCommand(JsonDocument &doc) {
 void reportResult(const String &id, const String &status) {
   if (id.isEmpty()) return;
 
+  // poll and result share the same host:port; with setReuse(true) this
+  // POST reuses the TLS connection opened by the preceding pollCommand.
   http.setConnectTimeout(15000);
   http.setTimeout(HTTP_TIMEOUT_MS);
 
@@ -252,7 +245,6 @@ void reportResult(const String &id, const String &status) {
   int code = http.POST(payload);
   Serial.printf("[result] POST -> %d\n", code);
   http.end();
-  closeConnectionOnError(code);
 }
 
 // ---------------------------------------------------------------------
@@ -265,8 +257,9 @@ void setup() {
   M5StackChan.begin();
   avatar.init();
 
-  netClient.setInsecure();   // skip cert validation (Let's Encrypt via Caddy)
-  http.setReuse(true);        // keep the TLS connection alive between requests
+  netClient.setInsecure();           // skip cert validation (nip.io / Let's Encrypt)
+  netClient.setHandshakeTimeout(20000); // generous TLS handshake budget (ms)
+  http.setReuse(true);               // result POST reuses poll's connection
 
   connectWiFi();
 }
@@ -275,20 +268,29 @@ void loop() {
   M5StackChan.update();
   ensureWiFi();
 
+  // Fresh TCP+TLS for every poll. Short requests (< 1 s) complete before
+  // any router/ISP idle-timeout can interfere. The mbedTLS context stays
+  // allocated in the global object — only the socket is re-opened, so
+  // there is no heap churn.
+  netClient.stop();
+
   static uint8_t pollFailures = 0;
 
   JsonDocument doc;
   if (!pollCommand(doc)) {
     pollFailures++;
-    // Exponential backoff: 1s, 2s, 4s, 8s, capped at 8s.
+    // Exponential backoff: 1 s, 2 s, 4 s, 8 s, capped at 8 s.
     uint32_t backoffMs = 1000UL << min((int)pollFailures - 1, 3);
+    Serial.printf("[poll] retry #%d in %lums  heap=%d\n",
+                  pollFailures, backoffMs, ESP.getFreeHeap());
     delay(backoffMs);
     return;
   }
   pollFailures = 0;
 
   if (doc["action"].isNull()) {
-    return;  // nothing to do, poll again immediately
+    delay(POLL_INTERVAL_MS);  // idle: wait 1.5 s before next short-poll
+    return;
   }
 
   String id = doc["id"] | "";

@@ -4,7 +4,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app import state
-from app.config import POLL_TIMEOUT, TOKEN
+from app.config import TOKEN
 from app.mcp_tools import mcp
 
 mcp_app = mcp.streamable_http_app()
@@ -36,9 +36,9 @@ async def healthz():
 
 @app.get("/poll")
 async def poll(token: str = Query(...)):
-    """ESP32 long-polls this for the next command (latest-only)."""
+    """ESP32 short-polls this for the next command (returns immediately)."""
     _check_token(token)
-    command = await state.wait_for_command(timeout=POLL_TIMEOUT)
+    command = await state.get_command()
     if command is None:
         return {"action": None}
     return command
